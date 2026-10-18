@@ -534,6 +534,7 @@ struct proc {
     CgroupFD cgroupfd;
     uid_t uid;
     int oomadj;
+    enum proc_type ptype;
     pid_t reg_pid; /* PID of the process that registered this record */
     bool valid;
     struct proc *pidhash_next;
@@ -1276,6 +1277,7 @@ static void register_oom_adj_proc(const struct lmk_procprio& proc, struct ucred*
         procp->uid = proc.uid;
         procp->reg_pid = cred->pid;
         procp->oomadj = oom_adj_score;
+        procp->ptype = proc.ptype;
         procp->valid = true;
         proc_insert(procp);
     } else {
@@ -1289,6 +1291,7 @@ static void register_oom_adj_proc(const struct lmk_procprio& proc, struct ucred*
         }
         proc_unslot(procp);
         procp->oomadj = oom_adj_score;
+        procp->ptype = proc.ptype;
         proc_slot(procp);
     }
 }
@@ -1298,6 +1301,7 @@ static void apply_proc_prio(const struct lmk_procprio& params, struct ucred* cre
     char val[20];
     int64_t tgid;
     char buf[pagesize];
+    struct lmk_procprio sanitized_params = params;
 
     if (params.oomadj < OOM_SCORE_ADJ_MIN || params.oomadj > OOM_SCORE_ADJ_MAX) {
         ALOGE("Invalid PROCPRIO oomadj argument %d", params.oomadj);
@@ -1305,8 +1309,12 @@ static void apply_proc_prio(const struct lmk_procprio& params, struct ucred* cre
     }
 
     if (params.ptype < PROC_TYPE_FIRST || params.ptype >= PROC_TYPE_COUNT) {
-        ALOGE("Invalid PROCPRIO process type argument %d", params.ptype);
-        return;
+        // Do not drop the whole update just because of an unrecognized process
+        // type, e.g. when framework and lmkd are temporarily out of sync on
+        // the enum. Fall back to PROC_TYPE_APP instead.
+        ALOGE("Invalid PROCPRIO process type argument %d, falling back to PROC_TYPE_APP",
+              params.ptype);
+        sanitized_params.ptype = PROC_TYPE_APP;
     }
 
     /* Check if registered process is a thread group leader */
@@ -1338,7 +1346,7 @@ static void apply_proc_prio(const struct lmk_procprio& params, struct ucred* cre
         }
     }
 
-    register_oom_adj_proc(params, cred);
+    register_oom_adj_proc(sanitized_params, cred);
 }
 
 static void cmd_procprio(LMKD_CTRL_PACKET packet, int field_count, struct ucred* cred) {
@@ -2321,6 +2329,47 @@ static struct proc *proc_adj_tail(int oomadj) {
     return (struct proc *)adjslot_tail(&procadjslot_list[ADJTOSLOT(oomadj)]);
 }
 
+// Protection level used while selecting a victim so that top and home apps
+// are killed last.
+// PROTECT_HOME_AND_TOP: skip both home and top processes.
+// PROTECT_TOP_ONLY:     allow killing home, still skip top processes.
+// PROTECT_NONE:         no protection, everything is killable (final fallback).
+enum protect_level {
+    PROTECT_HOME_AND_TOP = 0,
+    PROTECT_TOP_ONLY,
+    PROTECT_NONE,
+};
+
+static bool proc_is_top_critical(struct proc *procp) {
+    return procp->ptype == PROC_TYPE_TOP || procp->ptype == PROC_TYPE_TOP_BOUND;
+}
+
+// Returns true if procp must be skipped (protected) at the given level.
+static bool proc_is_protected(struct proc *procp, enum protect_level level) {
+    if (level == PROTECT_NONE) {
+        return false;
+    }
+    if (procp->ptype == PROC_TYPE_HOME && level == PROTECT_HOME_AND_TOP) {
+        return true;
+    }
+    return proc_is_top_critical(procp);
+}
+
+// Like proc_adj_tail but skips processes protected at the given level.
+static struct proc *proc_adj_tail_protected(int oomadj, enum protect_level level) {
+    struct adjslot_list *head = &procadjslot_list[ADJTOSLOT(oomadj)];
+    struct adjslot_list *curr = head->prev;
+
+    while (curr != head) {
+        struct proc *procp = (struct proc *)curr;
+        if (!proc_is_protected(procp, level)) {
+            return procp;
+        }
+        curr = curr->prev;
+    }
+    return NULL;
+}
+
 // When called from a non-main thread, adjslot_list_lock read lock should be taken.
 static struct proc *proc_adj_prev(int oomadj, int pid) {
     struct adjslot_list *head = &procadjslot_list[ADJTOSLOT(oomadj)];
@@ -2337,7 +2386,7 @@ static struct proc *proc_adj_prev(int oomadj, int pid) {
 }
 
 // Can be called only from the main thread.
-static struct proc *proc_get_heaviest(int oomadj) {
+static struct proc *proc_get_heaviest(int oomadj, enum protect_level level) {
     struct adjslot_list *head = &procadjslot_list[ADJTOSLOT(oomadj)];
     struct adjslot_list *curr = head->next;
     struct proc *maxprocp = NULL;
@@ -2345,10 +2394,15 @@ static struct proc *proc_get_heaviest(int oomadj) {
     char buf[LINE_MAX];
 
     if ((curr != head) && (curr->next == head)) {
-        // Our list only has one process.  No need to access procfs for its size.
-        return (struct proc *)curr;
+        // Our list only has one process.  No need to access procfs for its size.
+        struct proc *only = (struct proc *)curr;
+        return proc_is_protected(only, level) ? NULL : only;
     }
     while (curr != head) {
+        if (proc_is_protected((struct proc *)curr, level)) {
+            curr = curr->next;
+            continue;
+        }
         int pid = ((struct proc *)curr)->pid;
         int tasksize = proc_get_size(pid);
         int64_t dmabuf_pss_bytes;
@@ -2652,29 +2706,40 @@ static int find_and_kill_process(int min_score_adj, struct kill_info *ki, union 
                                  struct psi_data *pd) {
     int i;
     int killed_size = 0;
-    bool choose_heaviest_task = kill_heaviest_task;
 
-    for (i = OOM_SCORE_ADJ_MAX; i >= min_score_adj; i--) {
-        struct proc *procp;
+    /*
+     * Kill in increasing order of protection so that home and top apps are
+     * killed last: pass 1 (PROTECT_HOME_AND_TOP) only ordinary apps, pass 2
+     * (PROTECT_TOP_ONLY) home becomes eligible, pass 3 (PROTECT_NONE) top
+     * becomes eligible. A later pass is only reached when no less-protected
+     * victim exists anywhere in [min_score_adj, OOM_SCORE_ADJ_MAX].
+     */
+    for (enum protect_level level = PROTECT_HOME_AND_TOP; level <= PROTECT_NONE;
+            level = (enum protect_level)(level + 1)) {
+        bool choose_heaviest_task = kill_heaviest_task;
 
-        if (!choose_heaviest_task && i <= PERCEPTIBLE_APP_ADJ) {
-            /*
-             * If we have to choose a perceptible process, choose the heaviest one to
-             * hopefully minimize the number of victims.
-             */
-            choose_heaviest_task = true;
-        }
+        for (i = OOM_SCORE_ADJ_MAX; i >= min_score_adj; i--) {
+            struct proc *procp;
 
-        while (true) {
-            procp = choose_heaviest_task ?
-                proc_get_heaviest(i) : proc_adj_tail(i);
+            if (!choose_heaviest_task && i <= PERCEPTIBLE_APP_ADJ) {
+                /*
+                 * If we have to choose a perceptible process, choose the heaviest one to
+                 * hopefully minimize the number of victims.
+                 */
+                choose_heaviest_task = true;
+            }
 
-            if (!procp)
-                break;
+            while (true) {
+                procp = choose_heaviest_task ?
+                    proc_get_heaviest(i, level) : proc_adj_tail_protected(i, level);
 
-            killed_size = kill_one_process(procp, min_score_adj, ki, mi, wi, tm, pd);
-            if (killed_size >= 0) {
-                return killed_size;
+                if (!procp)
+                    break;
+
+                killed_size = kill_one_process(procp, min_score_adj, ki, mi, wi, tm, pd);
+                if (killed_size >= 0) {
+                    return killed_size;
+                }
             }
         }
     }
